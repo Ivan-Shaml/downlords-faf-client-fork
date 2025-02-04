@@ -76,6 +76,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 import static com.faforever.client.game.KnownFeaturedMod.FAF;
@@ -125,6 +126,7 @@ public class GameRunner implements InitializingBean {
   private final ReadOnlyObjectWrapper<GameInfo> runningGame = new ReadOnlyObjectWrapper<>();
   private final ReadOnlyBooleanWrapper running = new ReadOnlyBooleanWrapper();
   private final ReadOnlyObjectWrapper<Long> pid = new ReadOnlyObjectWrapper<>();
+  private final AtomicReference<CompletableFuture<GameLaunchResponse>> lastGameLaunchRequest = new AtomicReference<>();
 
   private CompletableFuture<Void> matchmakerFuture;
   private boolean gameKilled;
@@ -296,9 +298,27 @@ public class GameRunner implements InitializingBean {
     log.info("Joining game: '{}' ({})", game.getTitle(), game.getId());
 
     Set<String> simModUIds = game.getSimMods().keySet();
+    final Supplier<CompletableFuture<GameLaunchResponse>> gameLaunchSupplier = () -> {
+      final CompletableFuture<GameLaunchResponse> lastRequest = lastGameLaunchRequest.get();
+      if (lastRequest != null && !lastRequest.isDone()) {
+        lastRequest.cancel(true);
+      }
+
+      final CompletableFuture<GameLaunchResponse> newRequest = fafServerAccessor.requestJoinGame(game.getId(),
+                                                                                                 password);
+      lastGameLaunchRequest.set(newRequest);
+
+      return newRequest;
+    };
+
     prepareAndLaunchGameWhenReady(game.getFeaturedMod(), simModUIds, game.getMapFolderName(),
-                                  () -> fafServerAccessor.requestJoinGame(game.getId(), password)).exceptionally(
+                                  gameLaunchSupplier).exceptionally(
         throwable -> {
+          if (throwable instanceof CancellationException || throwable.getCause() instanceof CancellationException) {
+            log.debug("Previous game launch request was cancelled", throwable);
+            return null;
+          }
+
           log.error("Game could not be joined", throwable);
           notificationService.addImmediateErrorNotification(throwable, "games.couldNotJoin");
           return null;
